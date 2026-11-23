@@ -321,9 +321,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
 
       const colMeta = SCORE_COLUMNS.find((c) => c.key === targetCol) ?? SCORE_COLUMNS[0];
 
+      const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, '') || '';
+
       const requestScan = async (): Promise<ScanApiResult> => {
         const maxStt = studentsRef.current.reduce((max, s) => Math.max(max, s.stt), 45);
-        const res = await fetch('/api/scan', {
+        const res = await fetch(`${apiBase}/api/scan`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

@@ -111,7 +111,8 @@ export default function App() {
   activeClassIdRef.current = activeClassId;
 
   useEffect(() => {
-    void fetch('/api/health').catch(() => {});
+    const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, '') || '';
+    void fetch(`${apiBase}/api/health`).catch(() => {});
   }, []);
 
   const persistClassUpdate = useCallback(async (updatedClass: GradebookClass) => {
