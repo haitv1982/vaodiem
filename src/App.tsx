@@ -109,11 +109,41 @@ export default function App() {
 
   const activeClassIdRef = useRef<string | null>(activeClassId);
   activeClassIdRef.current = activeClassId;
+  const pendingSaveRef = useRef<Record<string, GradebookClass>>({});
+  const saveTimerRef = useRef<number | null>(null);
+
+  const flushPendingSaves = useCallback(async () => {
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    const items = Object.values(pendingSaveRef.current);
+    pendingSaveRef.current = {};
+    for (const item of items) {
+      await saveGradebook(item);
+    }
+  }, []);
+
+  const scheduleSaveGradebook = useCallback(
+    (gradebook: GradebookClass) => {
+      pendingSaveRef.current[gradebook.id] = gradebook;
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+      }
+      saveTimerRef.current = window.setTimeout(() => {
+        void flushPendingSaves();
+      }, 280);
+    },
+    [flushPendingSaves],
+  );
 
   useEffect(() => {
     const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, '') || '';
     void fetch(`${apiBase}/api/health`).catch(() => {});
-  }, []);
+    return () => {
+      void flushPendingSaves();
+    };
+  }, [flushPendingSaves]);
 
   const persistClassUpdate = useCallback(async (updatedClass: GradebookClass) => {
     const stamped = { ...updatedClass, updatedAt: new Date().toISOString() };
@@ -136,12 +166,12 @@ export default function App() {
             students: nextStudents,
             updatedAt: new Date().toISOString(),
           };
-          void saveGradebook(stamped);
+          scheduleSaveGradebook(stamped);
           return stamped;
         }),
       );
     },
-    [],
+    [scheduleSaveGradebook],
   );
 
   const handleUpdateComment = useCallback(
@@ -159,12 +189,12 @@ export default function App() {
             students: nextStudents,
             updatedAt: new Date().toISOString(),
           };
-          void saveGradebook(stamped);
+          scheduleSaveGradebook(stamped);
           return stamped;
         }),
       );
     },
-    [],
+    [scheduleSaveGradebook],
   );
 
   const handleUpdateClassMeta = useCallback(
@@ -458,6 +488,17 @@ export default function App() {
                   subjectLabel={activeClass.subject}
                   onApplyScore={handleUpdateScore}
                   onFocusStudentRow={handleFocusStudentRow}
+                  onFinishScanning={(count) => {
+                    void flushPendingSaves();
+                    if (window.innerWidth < 1024) {
+                      setActiveTab('table');
+                    }
+                    showToast(
+                      count > 0
+                        ? `Đã hoàn tất quét và lưu ${count} bài vào bảng điểm.`
+                        : 'Đã kết thúc phiên quét camera.',
+                    );
+                  }}
                 />
               ) : (
                 <div className="bg-white border border-slate-200 rounded-2xl lg:rounded-xl p-8 text-center space-y-3">

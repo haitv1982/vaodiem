@@ -27,20 +27,20 @@ export const GuideSection: React.FC = () => {
         <div className="border border-slate-200 rounded-xl p-4 space-y-2">
           <div className="flex items-center gap-2 text-sm font-display font-semibold text-slate-900">
             <Camera className="w-4 h-4 text-blue-700" />
-            <span>02. Quy ước ghi bài &amp; mở camera</span>
+            <span>02. Quy ước màu mực nhận diện nhanh</span>
           </div>
           <p className="text-xs text-slate-600 leading-relaxed">
-            Học sinh ghi rõ <strong>STT</strong> theo sổ điểm ở góc trên bài làm cạnh phần <strong>Điểm</strong> giáo viên chấm. Mở camera hướng vào 2 ô này trong khung ngắm chữ nhật để hệ thống quét nhanh nhất.
+            <strong>STT</strong> là chữ số học sinh viết bằng <strong>mực đen hoặc mực xanh</strong>; <strong>Điểm</strong> là chữ số giáo viên chấm bằng <strong>mực đỏ</strong>. Hướng camera vào 2 ô này trong khung chữ nhật để AI đọc tức thì.
           </p>
         </div>
 
         <div className="border border-slate-200 rounded-xl p-4 space-y-2">
           <div className="flex items-center gap-2 text-sm font-display font-semibold text-slate-900">
             <Zap className="w-4 h-4 text-blue-700" />
-            <span>03. Chụp liên tiếp 3 luồng không chờ đợi</span>
+            <span>03. Chụp liên tiếp cho đến khi bấm Kết thúc</span>
           </div>
           <p className="text-xs text-slate-600 leading-relaxed">
-            Không cần bấm nút chụp hay nút lưu: đưa bài kiểm tra vào khung giữ yên <strong>0,15 giây</strong>, máy tự chụp ngay, phát tiếng màn trập xác nhận rồi mở khóa sang bài tiếp theo ngay lập tức (tối đa 3 bài đọc song song ở chế độ nền và tự điền vào bảng điểm).
+            Hệ thống tự động chụp, phát tiếng màn trập, đối chiếu đúng cột <strong>TT</strong> và ghi thẳng vào cột điểm đang chọn với 3 luồng xử lý song song. Lật liên tiếp từng bài cho đến khi xong thì bấm nút <strong>Kết thúc</strong> để kiểm tra bảng điểm và xuất Excel.
           </p>
         </div>
 

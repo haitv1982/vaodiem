@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   FlipHorizontal,
   ScanLine,
+  Square,
   Volume2,
   VolumeX,
 } from 'lucide-react';
@@ -22,6 +23,7 @@ interface CameraScannerProps {
   subjectLabel: string;
   onApplyScore: (stt: number, column: ScoreColumnKey, score: number) => void;
   onFocusStudentRow: (stt: number) => void;
+  onFinishScanning?: (scannedCount: number) => void;
 }
 
 type DetectorStatus =
@@ -32,25 +34,33 @@ type DetectorStatus =
   | 'waiting_next_paper';
 
 const MAX_CONCURRENT_SCANS = 3;
-const SETTLE_MS = 150;
+const SETTLE_MS = 120;
 const ROI_W_RATIO = 0.72;
 const ROI_H_RATIO = 0.48;
 
 /**
- * Kiểm tra nhanh vùng ROI 64x48 (< 0.15ms) để chỉ chụp khi có bài kiểm tra (giấy sáng + nét chữ),
- * tránh chụp nhầm bàn trống hoặc cảnh vật xung quanh.
+ * Kiểm tra cục bộ cực nhanh (< 0.15ms trên 64x48) xem khung hình có phải bài kiểm tra:
+ * - Nền giấy sáng + có nét mực đen/xanh/đỏ
+ * - Tính mức thay đổi so với khung trước (chống rung tay) và so với ảnh vừa chụp (mở khóa nhanh khi lật sang tờ mới trên xấp bài)
  */
 function evaluateRoiFrame(
   curr: Uint8ClampedArray,
   prev: Uint8ClampedArray | null,
+  capturedLuma: Uint8Array | null,
   width: number,
   height: number,
-): { avgDiff: number; isPaperLike: boolean } {
+): {
+  avgDiff: number;
+  diffFromCaptured: number;
+  isPaperLike: boolean;
+  lumaSnapshot: Uint8Array;
+} {
   const totalPixels = width * height;
   let lumaSum = 0;
   let brightCount = 0;
   let edgeCount = 0;
   let diffSum = 0;
+  let capturedDiffSum = 0;
 
   const luma = new Uint8Array(totalPixels);
 
@@ -58,13 +68,16 @@ function evaluateRoiFrame(
     const y = (curr[i] * 77 + curr[i + 1] * 150 + curr[i + 2] * 29) >> 8;
     luma[p] = y;
     lumaSum += y;
-    if (y >= 118) brightCount++;
+    if (y >= 112) brightCount++;
 
     if (prev) {
       diffSum +=
         Math.abs(curr[i] - prev[i]) +
         Math.abs(curr[i + 1] - prev[i + 1]) +
         Math.abs(curr[i + 2] - prev[i + 2]);
+    }
+    if (capturedLuma) {
+      capturedDiffSum += Math.abs(y - capturedLuma[p]);
     }
   }
 
@@ -74,7 +87,7 @@ function evaluateRoiFrame(
       const idx = rowOffset + col;
       const gx = Math.abs(luma[idx] - luma[idx + 1]);
       const gy = Math.abs(luma[idx] - luma[idx + width]);
-      if (gx > 24 || gy > 24) {
+      if (gx > 22 || gy > 22) {
         edgeCount++;
       }
     }
@@ -84,14 +97,15 @@ function evaluateRoiFrame(
   const brightRatio = brightCount / totalPixels;
   const edgeRatio = edgeCount / totalPixels;
   const avgDiff = prev ? diffSum / (totalPixels * 3) : 99;
+  const diffFromCaptured = capturedLuma ? capturedDiffSum / totalPixels : 99;
 
   const isPaperLike =
-    avgLuma >= 104 &&
-    brightRatio >= 0.34 &&
-    edgeRatio >= 0.018 &&
-    edgeRatio <= 0.54;
+    avgLuma >= 96 &&
+    brightRatio >= 0.30 &&
+    edgeRatio >= 0.015 &&
+    edgeRatio <= 0.56;
 
-  return { avgDiff, isPaperLike };
+  return { avgDiff, diffFromCaptured, isPaperLike, lumaSnapshot: luma };
 }
 
 export const CameraScanner: React.FC<CameraScannerProps> = ({
@@ -101,12 +115,14 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   subjectLabel,
   onApplyScore,
   onFocusStudentRow,
+  onFinishScanning,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const motionCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const prevFrameDataRef = useRef<Uint8ClampedArray | null>(null);
+  const capturedLumaRef = useRef<Uint8Array | null>(null);
 
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
@@ -116,6 +132,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   const [audioEnabled, setAudioEnabled] = useState(true);
 
   const [inFlightCount, setInFlightCount] = useState(0);
+  const [sessionCount, setSessionCount] = useState(0);
   const [shutterFlash, setShutterFlash] = useState(false);
   const [detectorStatus, setDetectorStatus] = useState<DetectorStatus>('idle');
   const [statusHint, setStatusHint] = useState<string | null>(null);
@@ -136,6 +153,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   const onFocusStudentRowRef = useRef(onFocusStudentRow);
   onFocusStudentRowRef.current = onFocusStudentRow;
   const inFlightRef = useRef(0);
+  const sessionCountRef = useRef(0);
+  const lastLumaSnapshotRef = useRef<Uint8Array | null>(null);
 
   const waitingNextPaperRef = useRef(false);
   const sawPaperRemovedRef = useRef(false);
@@ -158,7 +177,18 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     waitingNextPaperRef.current = false;
     sawPaperRemovedRef.current = false;
     prevFrameDataRef.current = null;
+    capturedLumaRef.current = null;
   }, []);
+
+  const handleFinishSession = useCallback(() => {
+    stopCamera();
+    try {
+      sessionStorage.removeItem('vnedu_camera_started');
+    } catch {
+      // ignore
+    }
+    onFinishScanning?.(sessionCountRef.current);
+  }, [stopCamera, onFinishScanning]);
 
   const startCamera = useCallback(
     async (deviceId?: string) => {
@@ -200,6 +230,9 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         sawPaperRemovedRef.current = false;
         stableStartAtRef.current = 0;
         prevFrameDataRef.current = null;
+        capturedLumaRef.current = null;
+        sessionCountRef.current = 0;
+        setSessionCount(0);
         setCameraActive(true);
         try {
           sessionStorage.setItem('vnedu_camera_started', '1');
@@ -268,11 +301,9 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       setLastLatencyMs(result.latencyMs);
 
       if (!result.hasPaper || result.stt === null || result.score === null) {
-        if (inFlightRef.current <= 1) {
-          waitingNextPaperRef.current = false;
-          sawPaperRemovedRef.current = false;
-        }
-        setStatusHint('Bài vừa chụp chưa rõ STT hoặc Điểm, đưa lại vào khung nếu còn thiếu.');
+        waitingNextPaperRef.current = false;
+        sawPaperRemovedRef.current = false;
+        setStatusHint('Chưa thấy đủ STT (mực đen/xanh) và Điểm (mực đỏ), giữ lại vào khung.');
         return;
       }
 
@@ -285,23 +316,23 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       const isValidScore = scoreNum >= 0 && scoreNum <= 10;
 
       if (!matched) {
+        waitingNextPaperRef.current = false;
         setStatusHint(`STT ${sttNum} không có trong danh sách lớp ${classNameLabel}`);
         return;
       }
 
       if (!isValidScore || result.confidence === 'low') {
-        if (inFlightRef.current <= 1) {
-          waitingNextPaperRef.current = false;
-          sawPaperRemovedRef.current = false;
-        }
-        setStatusHint(`Bài #${sttNum} hơi mờ, giữ yên nhẹ để đọc lại.`);
+        waitingNextPaperRef.current = false;
+        setStatusHint(`Bài #${sttNum} hơi mờ, giữ yên để đọc lại.`);
         return;
       }
 
-      // Hợp lệ -> tự động ghi thẳng vào bảng điểm (không cần bấm nút Lưu)
+      // Hợp lệ -> đối chiếu STT & nhập điểm ngay lập tức vào danh sách
       setStatusHint(null);
       onApplyScoreRef.current(matched.stt, targetCol, scoreNum);
       onFocusStudentRowRef.current(matched.stt);
+      sessionCountRef.current += 1;
+      setSessionCount(sessionCountRef.current);
 
       setLastSavedBanner({
         stt: matched.stt,
@@ -320,7 +351,6 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       setInFlightCount(inFlightRef.current);
 
       const colMeta = SCORE_COLUMNS.find((c) => c.key === targetCol) ?? SCORE_COLUMNS[0];
-
       const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, '') || '';
 
       const requestScan = async (): Promise<ScanApiResult> => {
@@ -348,6 +378,9 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         }
 
         if (!res.ok) {
+          if (res.status === 429) {
+            throw new Error(`RATE_LIMIT:${data.error || 'Đang chạm giới hạn tốc độ'}`);
+          }
           if (res.status === 502 || res.status === 503 || res.status === 504) {
             throw new Error(`TRANSIENT:${data.error || 'Máy chủ AI đang bận'}`);
           }
@@ -363,8 +396,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           data = await requestScan();
         } catch (firstErr) {
           const msg = firstErr instanceof Error ? firstErr.message : '';
-          if (msg === 'TRANSIENT_HTML' || msg.startsWith('TRANSIENT:')) {
-            await new Promise((r) => setTimeout(r, 700));
+          if (msg.startsWith('RATE_LIMIT:')) {
+            await new Promise((r) => setTimeout(r, 1000));
+            data = await requestScan();
+          } else if (msg === 'TRANSIENT_HTML' || msg.startsWith('TRANSIENT:')) {
+            await new Promise((r) => setTimeout(r, 400));
             data = await requestScan();
           } else {
             throw firstErr;
@@ -377,9 +413,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         const friendlyMsg =
           rawMsg === 'TRANSIENT_HTML'
             ? 'Máy chủ đang khởi động lại, vui lòng giữ bài trong giây lát...'
-            : rawMsg.startsWith('TRANSIENT:')
-              ? rawMsg.replace('TRANSIENT:', '')
-              : rawMsg || 'Máy chủ AI đang bận, tiếp tục quét bình thường.';
+            : rawMsg.startsWith('RATE_LIMIT:')
+              ? rawMsg.replace('RATE_LIMIT:', '')
+              : rawMsg.startsWith('TRANSIENT:')
+                ? rawMsg.replace('TRANSIENT:', '')
+                : rawMsg || 'Máy chủ AI đang bận, tiếp tục quét bình thường.';
         setStatusHint(friendlyMsg);
       } finally {
         inFlightRef.current = Math.max(0, inFlightRef.current - 1);
@@ -389,7 +427,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     [processScanResult],
   );
 
-  // Chụp ngay lập tức không chờ kết quả bài trước (Pipelined 3 luồng song song)
+  // Chụp ngay lập tức không chờ kết quả bài trước (3 luồng song song, ảnh gọn <=384px JPEG)
   const captureAndScanFrame = useCallback(() => {
     const video = videoRef.current;
     if (!video || video.readyState < 2) return;
@@ -399,19 +437,18 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     const vh = video.videoHeight;
     if (!vw || !vh) return;
 
-    // Phát tiếng chụp ảnh + nháy sáng ngay lập tức khi chụp!
     if (audioEnabledRef.current) {
       playShutterSound();
     }
     setShutterFlash(true);
-    window.setTimeout(() => setShutterFlash(false), 85);
+    window.setTimeout(() => setShutterFlash(false), 80);
 
     const sw = Math.round(vw * ROI_W_RATIO);
     const sh = Math.round(vh * ROI_H_RATIO);
     const sx = Math.round((vw - sw) / 2);
     const sy = Math.round((vh - sh) / 2);
 
-    const targetWidth = Math.min(448, sw);
+    const targetWidth = Math.min(384, sw);
     const targetHeight = Math.round((sh / sw) * targetWidth);
 
     if (!captureCanvasRef.current) {
@@ -432,7 +469,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetWidth, targetHeight);
     ctx.restore();
 
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.68);
+    if (lastLumaSnapshotRef.current) {
+      capturedLumaRef.current = new Uint8Array(lastLumaSnapshotRef.current);
+    }
     lastAutoScanAtRef.current = Date.now();
     waitingNextPaperRef.current = true;
     sawPaperRemovedRef.current = false;
@@ -441,22 +481,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     void sendImageForScan(dataUrl, activeColumn);
   }, [mirrorCapture, activeColumn, sendImageForScan]);
 
-  // Phím Space hỗ trợ chụp nhanh trên máy tính nếu muốn
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (e.code === 'Space' && cameraActive) {
-        e.preventDefault();
-        waitingNextPaperRef.current = false;
-        captureAndScanFrame();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cameraActive, captureAndScanFrame]);
-
-  // Vòng lặp 50ms: giữ yên 0,15 giây trên bài kiểm tra -> chụp nối tiếp không chờ API trả về
+  // Vòng lặp 45ms: phát hiện bài trên tay nhanh (~0,12s), mở khóa tức thì khi lật sang bài tiếp theo
   useEffect(() => {
     if (!cameraActive) {
       setDetectorStatus('idle');
@@ -468,7 +493,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     const analyzeMotionAndPaper = () => {
       const video = videoRef.current;
       if (!video || video.readyState < 2 || !video.videoWidth) {
-        timerId = window.setTimeout(analyzeMotionAndPaper, 100);
+        timerId = window.setTimeout(analyzeMotionAndPaper, 80);
         return;
       }
 
@@ -484,29 +509,32 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       const vw = video.videoWidth;
       const vh = video.videoHeight;
       const sw = Math.round(vw * ROI_W_RATIO);
-      const sh = Math.round(vh * ROI_H_RATIO);
+      const sy = Math.round((vh - Math.round(vh * ROI_H_RATIO)) / 2);
       const sx = Math.round((vw - sw) / 2);
-      const sy = Math.round((vh - sh) / 2);
+      const sh = Math.round(vh * ROI_H_RATIO);
 
       mCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 64, 48);
       const frame = mCtx.getImageData(0, 0, 64, 48).data;
 
-      const { avgDiff, isPaperLike } = evaluateRoiFrame(
+      const { avgDiff, diffFromCaptured, isPaperLike, lumaSnapshot } = evaluateRoiFrame(
         frame,
         prevFrameDataRef.current,
+        capturedLumaRef.current,
         64,
         48,
       );
+      lastLumaSnapshotRef.current = lumaSnapshot;
       const now = Date.now();
 
       if (waitingNextPaperRef.current) {
-        // Mở khóa ngay khi đưa bài cũ ra khỏi khung hoặc đổi sang tờ mới (avgDiff > 13)
+        // Mở khóa ngay khi: rút bài ra (!isPaperLike), hoặc lật/đưa sang bài khác (avgDiff > 10 hoặc khác ảnh đã chụp > 8.5)
         if (!isPaperLike) {
           sawPaperRemovedRef.current = true;
           setDetectorStatus('no_paper');
-        } else if (sawPaperRemovedRef.current || avgDiff > 13) {
+        } else if (sawPaperRemovedRef.current || avgDiff > 10 || diffFromCaptured > 8.5) {
           waitingNextPaperRef.current = false;
           sawPaperRemovedRef.current = false;
+          capturedLumaRef.current = null;
           stableStartAtRef.current = 0;
           setDetectorStatus('moving');
         } else {
@@ -515,12 +543,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       } else if (!isPaperLike) {
         stableStartAtRef.current = 0;
         setDetectorStatus('no_paper');
-      } else if (avgDiff > 5.5) {
+      } else if (avgDiff > 8.5) {
         stableStartAtRef.current = 0;
         setDetectorStatus('moving');
       } else {
-        // Bài kiểm tra đã vào khung & ổn định 0,15 giây -> chụp luôn miễn còn slot trong 3 luồng
-        const cooldownOk = now - lastAutoScanAtRef.current > 300;
+        const cooldownOk = now - lastAutoScanAtRef.current > 240;
         const slotReady = inFlightRef.current < MAX_CONCURRENT_SCANS;
         if (cooldownOk && slotReady) {
           if (stableStartAtRef.current === 0) {
@@ -534,10 +561,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       }
 
       prevFrameDataRef.current = new Uint8ClampedArray(frame);
-      timerId = window.setTimeout(analyzeMotionAndPaper, 50);
+      timerId = window.setTimeout(analyzeMotionAndPaper, 45);
     };
 
-    timerId = window.setTimeout(analyzeMotionAndPaper, 100);
+    timerId = window.setTimeout(analyzeMotionAndPaper, 80);
     return () => {
       if (timerId !== null) window.clearTimeout(timerId);
     };
@@ -553,10 +580,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       case 'settling':
         return 'Đang chụp...';
       case 'moving':
-        return 'Giữ yên 0,15s...';
+        return 'Giữ nhẹ...';
       case 'no_paper':
       default:
-        return 'Đưa STT & Điểm vào khung (tự chụp sau 0,15s)';
+        return 'Đưa STT (mực đen/xanh) & Điểm (mực đỏ) vào khung';
     }
   };
 
@@ -573,8 +600,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
 
         <div className="flex items-center gap-1.5 shrink-0">
           {inFlightCount > 0 ? (
-            <span className="text-xs font-medium text-blue-700 tabular-nums px-1.5">
-              Đang đọc {inFlightCount} bài...
+            <span className="text-xs font-medium text-blue-700 tabular-nums px-1">
+              Đang đọc {inFlightCount}...
             </span>
           ) : (
             lastLatencyMs !== null && (
@@ -603,6 +630,16 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           >
             <FlipHorizontal className="w-4 h-4" />
           </button>
+          {cameraActive && (
+            <button
+              type="button"
+              onClick={handleFinishSession}
+              className="min-h-[40px] sm:min-h-[36px] px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <Square className="w-3 h-3 fill-current" />
+              Kết thúc
+            </button>
+          )}
         </div>
       </div>
 
@@ -612,6 +649,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           if (cameraActive && waitingNextPaperRef.current) {
             waitingNextPaperRef.current = false;
             sawPaperRemovedRef.current = true;
+            capturedLumaRef.current = null;
             setDetectorStatus('idle');
           }
         }}
@@ -644,9 +682,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                     : 'border-dashed border-white/85'
               }`}
             >
-              <div className="flex items-center justify-between text-[11px] font-medium text-white drop-shadow">
-                <span>Quét nối tiếp 3 luồng</span>
-                <span className="font-mono tabular-nums">{activeColMeta.shortLabel}</span>
+              <div className="flex items-center justify-between text-[11px] font-medium text-white drop-shadow gap-2">
+                <span>Đen/Xanh: STT · Đỏ: Điểm</span>
+                <span className="font-mono tabular-nums shrink-0">
+                  {activeColMeta.shortLabel}{sessionCount > 0 ? ` · ${sessionCount} bài` : ''}
+                </span>
               </div>
               <div className="text-center text-xs font-medium text-white drop-shadow bg-slate-900/55 rounded-md py-1 px-2">
                 {getOverlayPrompt()}
@@ -663,12 +703,12 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             </div>
             <div className="space-y-1">
               <h3 className="font-display font-semibold text-base text-white">
-                Quét điểm tự động siêu tốc
+                Quét nhanh STT &amp; Điểm mực đỏ
               </h3>
               <p className="text-xs text-slate-300 leading-relaxed">
                 {cameraError
                   ? cameraError
-                  : 'Mở camera, giữ bài yên 0,15s là tự chụp liên tiếp 3 luồng song song và lưu điểm tự động.'}
+                  : 'Mở camera, máy tự nhận STT (mực đen/xanh) và Điểm (mực đỏ) rồi ghi thẳng vào sổ điểm đến khi bạn bấm Kết thúc.'}
               </p>
             </div>
             <button
@@ -689,7 +729,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           <div className="flex items-center gap-2 min-w-0">
             <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
             <span className="text-sm font-semibold text-emerald-950 truncate">
-              #{lastSavedBanner.stt} · {lastSavedBanner.name}
+              TT {lastSavedBanner.stt} · {lastSavedBanner.name}
             </span>
           </div>
           <div className="font-mono tabular-nums text-base font-bold text-emerald-800 shrink-0">

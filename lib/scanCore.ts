@@ -25,21 +25,21 @@ const SCAN_RESPONSE_SCHEMA = {
   properties: {
     ok: {
       type: Type.BOOLEAN,
-      description: 'true nếu là bài kiểm tra có STT và Điểm rõ, false nếu không phải bài hoặc trống.',
+      description: 'true nếu thấy chữ số mực đen/xanh (STT) và mực đỏ (Điểm) trên bài kiểm tra.',
     },
     stt: {
       type: Type.INTEGER,
       nullable: true,
-      description: 'Số thứ tự học sinh (1..60), null nếu không rõ.',
+      description: 'Số thứ tự học sinh viết bằng mực đen hoặc xanh (1..60), null nếu không rõ.',
     },
     score: {
       type: Type.NUMBER,
       nullable: true,
-      description: 'Điểm (0..10, đổi dấu phẩy->chấm, vd 8,5->8.5), null nếu không rõ.',
+      description: 'Điểm giáo viên chấm bằng mực đỏ (0..10, đổi phẩy->chấm, vd 8,5->8.5), null nếu không rõ.',
     },
     low: {
       type: Type.BOOLEAN,
-      description: 'true nếu ảnh mờ hoặc chữ số không chắc chắn.',
+      description: 'true nếu ảnh mờ hoặc không chắc chữ số.',
     },
   },
   required: ['ok', 'stt', 'score', 'low'],
@@ -156,7 +156,10 @@ export async function runScanRequest(input: ScanInput): Promise<ScanOutput> {
     const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
     const ai = getGeminiClient();
 
-    const systemInstruction = `Đọc STT (1..${maxStt}) và Điểm (0..10, đổi dấu phẩy->chấm) cột ${columnLabel} trên bài kiểm tra. Nếu không phải bài kiểm tra hoặc thiếu STT/Điểm rõ ràng: ok=false, stt=null, score=null.`;
+    const systemInstruction = `Chế độ quét nhanh bài kiểm tra cột ${columnLabel}. Chỉ đọc 2 chữ số:
+1) STT (1..${maxStt}): chữ số viết tay bằng mực ĐEN hoặc mực XANH của học sinh.
+2) Điểm (0..10, đổi dấu phẩy->chấm): chữ số viết bằng mực ĐỎ của giáo viên chấm.
+Nếu không phải bài kiểm tra hoặc thiếu 1 trong 2 số rõ ràng: ok=false, stt=null, score=null.`;
 
     const contents = {
       parts: [
@@ -167,7 +170,7 @@ export async function runScanRequest(input: ScanInput): Promise<ScanOutput> {
           },
         },
         {
-          text: 'STT, Điểm',
+          text: 'STT (mực đen/xanh) và Điểm (mực đỏ)?',
         },
       ],
     };
@@ -185,7 +188,7 @@ export async function runScanRequest(input: ScanInput): Promise<ScanOutput> {
             responseSchema: SCAN_RESPONSE_SCHEMA,
           },
         }),
-        6500,
+        5500,
         'lite',
       );
 
